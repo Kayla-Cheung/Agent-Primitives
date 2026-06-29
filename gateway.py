@@ -1,88 +1,113 @@
+import os
 import asyncio
 import json
+from typing import Optional, Any, Type, Dict
 from pydantic import BaseModel, ValidationError
-from typing import Type, TypeVar, Optional
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
-# 使用泛型 T，代表任何继承自 BaseModel 的 Pydantic 契约
-T = TypeVar('T', bound=BaseModel)
+# 自动寻找项目根目录的 .env 文件
+load_dotenv()
 
 class AsyncLLMGateway:
-    def __init__(self, max_concurrent_requests: int = 10, max_retries: int = 3):
-        # 1. 物理滤纸：时间阀门 (Semaphore)
-        # 无论多少个 Agent 同时发起请求，最多只有 10 个能进入网络层
-        self._semaphore = asyncio.Semaphore(max_concurrent_requests)
-        self.max_retries = max_retries
-
-    async def _mock_network_call_to_llm(self, prompt: str, is_retry: bool = False) -> str:
-        """
-        模拟一次极不稳定的底层大模型网络请求。
-        """
-        await asyncio.sleep(1) # 模拟网络延迟
-        if not is_retry:
-            # 第一次调用，大模型必定发神经，吐出破损的数据（或者少传必填字段）
-            return '{"tool_name": "search", "hallucination": "我忘了写thought字段"}'
-        else:
-            # 第二次调用（被网关骂了之后），大模型老实了，吐出符合契约的干净数据
-            return '{"thought": "发现之前的错误，现在重试", "tool_name": "search_web", "arguments": {}}'
-
-    async def generate(self, prompt: str, contract: Type[T]) -> T:
-        """
-        核心网关出口：吃进 Prompt，吐出绝对符合 contract（Pydantic 契约）的晶体。
-        """
-        # 限制并发，排队进入
-        async with self._semaphore:
-            current_prompt = prompt
-            
-            # 双层自纠错回路 (The Self-Correction Loop)
-            for attempt in range(self.max_retries):
-                try:
-                    print(f"🔄 [尝试 {attempt+1}/{self.max_retries}] 正在请求大模型...")
-                    
-                    # 1. 获取网络传输回来的死字符串 (JSON)
-                    raw_json_string = await self._mock_network_call_to_llm(
-                        current_prompt, 
-                        is_retry=(attempt > 0)
-                    )
-                    
-                    # 2. 转为内存中的字典
-                    raw_dict = json.loads(raw_json_string)
-                    
-                    # 3. 结构滤纸打桩：尝试强转为 Pydantic 对象
-                    # 如果这一步不抛出异常，说明数据纯净！
-                    validated_object = contract(**raw_dict)
-                    
-                    print(f"✅ 提取成功！获得纯净对象。")
-                    return validated_object
-                    
-                except json.JSONDecodeError:
-                    error_msg = "你的输出连合法的 JSON 都不是，请重新输出标准 JSON。"
-                    print(f"⚠️ [熔断] JSON格式彻底损坏。将原路打回...")
-                    current_prompt += f"\n\nSystem Error: {error_msg}"
-                    
-                except ValidationError as e:
-                    # 获取 Pydantic 极其精准的机器报错
-                    error_msg = e.json()
-                    print(f"⚠️ [熔断] 数据不符合契约！拦截到的错误：\n{error_msg}\n将原路打回...")
-                    # 把报错塞进 Prompt 再次发送
-                    current_prompt += f"\n\nSystem Error: 你的输出不符合 Pydantic Schema，报错如下。请修正：\n{error_msg}"
-
-            raise Exception(f"❌ 大模型简直不可理喻，重试 {self.max_retries} 次后仍然无法符合契约。系统抛弃该请求。")
-
-# --- 运行测试 ---
-# 定义一份契约
-class MockAgentResponse(BaseModel):
-    thought: str
-    tool_name: str
-
-async def main():
-    gateway = AsyncLLMGateway(max_concurrent_requests=5)
+    """
+    SINA V3 统一大模型网关
+    负责：并发控制、指数退避重试、JSON 强制校验、错误降级
+    """
+    def __init__(self):
+        self.client = AsyncOpenAI(
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com"
+        )
     
-    # 向网关发起请求。我们要求它最后必须返还给我们一个 MockAgentResponse 对象。
-    result = await gateway.generate("请输出当前天气", contract=MockAgentResponse)
-    
-    print("\n--- 最终 SINA 引擎收到的数据 (内存对象) ---")
-    print("Type:", type(result))
-    print("Content:", result)
+    async def generate_structured(
+        self, 
+        system_prompt: str, 
+        user_prompt: str, 
+        response_model: Type[BaseModel],
+        max_retries: int = 3,
+        temperature: float = 0.3
+    ) -> Optional[Any]:
+        """
+        带重试和结构化校验的大模型调用
+        """
+        for attempt in range(max_retries):
+            try:
+                # 兼容 Pydantic V1 和 V2 的 schema 提取
+                schema_json = response_model.schema_json() if hasattr(response_model, 'schema_json') else json.dumps(response_model.model_json_schema())
+                
+                sys_msg = (
+                    f"{system_prompt}\n\n"
+                    f"CRITICAL: You MUST return ONLY valid JSON matching this schema:\n{schema_json}\n"
+                    f"Do not wrap the JSON in markdown code blocks, just return the raw JSON string."
+                )
+                
+                response = await self.client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    response_format={"type": "json_object"}
+                )
+                
+                raw_content = response.choices[0].message.content.strip()
+                
+                # 清理可能残留的 markdown 标记
+                if raw_content.startswith("```json"):
+                    raw_content = raw_content[7:]
+                if raw_content.endswith("```"):
+                    raw_content = raw_content[:-3]
+                raw_content = raw_content.strip()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+                # 尝试解析并验证
+                parsed_data = response_model.parse_raw(raw_content) if hasattr(response_model, 'parse_raw') else response_model.model_validate_json(raw_content)
+                return parsed_data
+                
+            except (ValidationError, json.JSONDecodeError) as e:
+                print(f"[Gateway] Attempt {attempt+1}/{max_retries} JSON Validation Failed: {e}")
+                if attempt == max_retries - 1:
+                    print(f"[Gateway] Max retries reached. Raw output: {raw_content}")
+                    return None
+                
+                # 【核心修复】：闭环自纠错，将报错反馈给下一轮的 Prompt
+                user_prompt += f"\n\n[SYSTEM ERROR]: Previous attempt failed with:\n{str(e)}\nFix the JSON structure and try again."
+                
+                await asyncio.sleep(2 ** attempt) # 指数退避
+                
+            except Exception as e:
+                print(f"[Gateway] Attempt {attempt+1}/{max_retries} API Request Failed: {e}")
+                if attempt == max_retries - 1:
+                    return None
+                await asyncio.sleep(2 ** attempt)
+
+    async def generate_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_retries: int = 3,
+        temperature: float = 0.3
+    ) -> str:
+        """
+        带重试的普通文本大模型调用（兼容不强制要求 JSON 的旧模块）
+        """
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"[Gateway] Text Generation Attempt {attempt+1}/{max_retries} Failed: {e}")
+                if attempt == max_retries - 1:
+                    return ""
+                await asyncio.sleep(2 ** attempt)
+
+# 暴露单例供全局调用
+gateway = AsyncLLMGateway()
